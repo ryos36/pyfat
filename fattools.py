@@ -11,6 +11,21 @@ def get_all_files(fat, path=""):
 			f["name"] = path + "/" + f["name"]
 		if f["attributes"] & FAT.Attribute.DIRECTORY:
 			files.extend(get_all_files(fat, path + "/" + f["name"] if len(path) else f["name"]))
+
+		cluster = f["cluster"]
+		clusters = [f["cluster"]]
+		last_no_in = False
+		while True:
+			next_cluster = fat.next_cluster(cluster)
+			if next_cluster > 0xffffff0 :
+				if not last_no_in :
+					clusters.append(cluster)
+				break
+			last_no_in = ( next_cluster - cluster ) != 1 
+			if last_no_in :
+				clusters.append(next_cluster)
+			cluster = next_cluster
+		f["clusters"] = clusters
 	return files
 
 def get_file_from_sector(fat, sector):
@@ -58,7 +73,9 @@ def main():
 			print argv
 			fat = FAT(open(argv[i+2], "rb"))
 			if arg == "--list":
-				print "List files"
+				print "List files:" + argv[2]
+				for f in get_all_files(fat, argv[2]):
+					print f
 				return 0
 			elif arg == "--frag":
 				fragmented_files = get_fragmented_files(fat)
@@ -66,7 +83,7 @@ def main():
 					print f["name"], "is fragmented"
 				return 0
 			elif arg == "--sect":
-				sector = int(argv[1])
+				sector = int(argv[2])
 				f = get_file_from_sector(fat, sector)
 				if f:
 					for k, v in f.iteritems():

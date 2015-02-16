@@ -1,16 +1,10 @@
-#!/usr/bin/env python
-# -*- encoding: utf-8 -*-
-from datetime import datetime, date
-from struct import unpack
-from os import SEEK_SET
-
-# TODO:
-#  Add docstrings
-#  write_file
-#  etc.
+from struct import unpack, pack
+from os import SEEK_SET, path
+from time import localtime
+import array
 
 class FAT(object):
-	Version = "0.01"
+	Version = "0.2"
 
 	# Static constants used
 	EOF_FAT12 = 0x00000ff8
@@ -34,6 +28,12 @@ class FAT(object):
 		ARCHIVE = 0x20
 		LONGNAME = READONLY | HIDDEN | SYSTEM | LABEL
 
+	class FatalError(Exception):
+		def __init__(self, msg):
+			self.msg = msg
+		def __str__(self):
+			return "Fatal Error %s" % self.msg
+
 	class FileNotFoundError(Exception):
 		def __init__(self, path):
 			self.path = path
@@ -43,89 +43,44 @@ class FAT(object):
 	def __init__(self, fd):
 		self.fd = fd
 		self.__start = fd.tell()
-		self.info = self.__parse_bootsector()
-
-		# Calculate the offset to the first FAT
-		self.__fat_start = self.__start + self.info["reserved_sectors"] * self.info["sector_size"]
-
-		self.fat_type, self.EOF, self.__num_clusters = self.__determine_type()
-
-		# Calculate the offset to the root directory
-		self.__root_dir = ((self.info["num_fats"] * self.info["sectors_per_fat"]) *
-			self.info["sector_size"]) + self.__fat_start
-
-		# Calculate the offset to the actual data start
-		self.__data_start = self.__root_dir + (FAT.DIRSIZE * self.info["root_entries"])
-
-	# Determines which type of FAT it is depending on the properties
-	def __determine_type(self):
-		root_dir_sectors = ((self.info["root_entries"] * FAT.DIRSIZE) +
-			(self.info["sector_size"] - 1)) / self.info["sector_size"]
-		data_sectors = self.info["total_sectors"] - (self.info["reserved_sectors"] +
-			(self.info["num_fats"] * self.info["sectors_per_fat"]) + root_dir_sectors)
-		num_clusters = data_sectors / self.info["sectors_per_cluster"]
-		if num_clusters < 4085:
-			return (FAT.Type.FAT12, FAT.EOF_FAT12, num_clusters)
-		elif num_clusters < 65525:
-			return (FAT.Type.FAT16, FAT.EOF_FAT16, num_clusters)
+		self.info = self.__parse_bios_prameter_block()
+		if self.info["sectors_per_fat"] == 0 :
+			self.info.update(self.__parse_bios_prameter_block32())
 		else:
-			return (FAT.Type.FAT32, FAT.EOF_FAT32, num_clusters)
+			self.info.update(self.__parse_boot_sector16())
 
-	def __next_cluster(self, cluster):
-		offset = self.__fat_start
-		if self.fat_type == FAT.Type.FAT12:
-			offset += cluster + (cluster / 2)
-			self.fd.seek(offset, SEEK_SET)
-			value = unpack("<H", self.fd.read(2))[0]
-			return value >> 4 if cluster & 1 else value & 0xfff
-		elif self.fat_type == FAT.Type.FAT16:
-			offset += cluster * 2
-			self.fd.seek(offset, SEEK_SET)
-			return unpack("<H", self.fd.read(2))[0]
-		elif self.fat_type == FAT.Type.FAT32:
-			offset += cluster * 4
-			self.fd.seek(offset, SEEK_SET)
-			return unpack("<L", self.fd.read(4))[0]
-		else:
-			raise NotImplementedError
+		self.__fat_start_offset = self.info["reserved_sector_count"] * self.info["byte_per_sector"]
+		self.type, self.EOF, self.__num_clusters = self.__determine_type()
 
-	def next_free_cluster(self, start=2):
-		for i in range(start, self.__num_clusters):
-			cluster = self.__next_cluster(i)
-			if cluster == 0:
-				return i
-		return self.EOF
+		self.__root_dir_offset = ((self.info["num_fats"] * self.info["sectors_per_fat"]) * self.info["byte_per_sector"]) + self.__fat_start_offset
 
-	def get_cluster_chain(self, cluster):
-		chain = [cluster]
-		if cluster == 0:
-			return chain
-		while cluster < self.EOF:
-			chain.append(self.__next_cluster(cluster))
-			cluster = chain[-1]
-		return chain[:-1]
+		self.__data_start_offset = self.__root_dir_offset + (FAT.DIRSIZE * self.info["root_entry_count"])
+		if type == FAT.Type.FAT32 :
+			self.__root_dir_offset = self.cluster_to_offset(self.info["root_cluster"])
 
-	def read_cluster(self, cluster):
-		if cluster < 2:
-			return ""
-		self.fd.seek(self.cluster_to_offset(cluster))
-		return self.fd.read(self.info["sectors_per_cluster"] * self.info["sector_size"])
+	def root_dir_offset(self):
+		return self.__root_dir_offset
 
-	# Calculate the logical sector number from the cluster
-	def cluster_to_offset(self, cluster):
-		offset = ((cluster - 2) * self.info["sectors_per_cluster"]) * self.info["sector_size"]
-		return self.__data_start + offset
+	def data_start_offset(self):
+		return self.__data_start_offset
 
-	# Read everything we need from the bootsector
-	def __parse_bootsector(self):
+	def copy_fat(self):
+		fat_n = self.info["num_fats"]
+
+		self.fd.seek(self.__fat_start_offset, SEEK_SET)
+		fat_data = self.fd.read(self.info["sectors_per_fat"] * self.info["byte_per_sector"])
+		for fat_i in range(1, fat_n ):
+			self.fd.write(fat_data)
+
+	def __parse_bios_prameter_block(self):
 		data = unpack("<3x8sHBHBHHBHHHLL", self.fd.read(36))
 		return {
-			"oem": data[0].strip(" "),
-			"sector_size": data[1],
+			"oem_name": data[0].strip(" "),
+			"byte_per_sector": data[1],
 			"sectors_per_cluster": data[2],
-			"reserved_sectors": data[3],
+			"reserved_sector_count": data[3],
 			"num_fats": data[4],
-			"root_entries": data[5],
+			"root_entry_count": data[5],
 			"total_sectors": data[6] if data[6] != 0 else data[12],
 			"media_descriptor": data[7],
 			"sectors_per_fat": data[8],
@@ -134,117 +89,203 @@ class FAT(object):
 			"hidden_sectors": data[11]
 		}
 
-	# Convert a FAT date to a date object
-	def __parse_fat_date(self, v):
-		year, month, day = 1980 + (v >> 9), (v >> 5) & 0x1f, v & 0x1f
-		month = min(max(month, 12), 1)
-		day = min(max(day, 31), 1)
-		return date(year, month, day)
+	def __parse_bios_prameter_block32(self):
+		data = unpack("<LHHLHH12xBxBL11s8s", self.fd.read(54))
+		return {
+			"sectors_per_fat": data[0],
+			"ext_flags" : data[1],
+			"fsver" : data[2],
+			"root_cluster" : data[3],
+			"fsinfo" : data[4],
+			"backup_boot_sec" : data[5],
+			"drive_num" : data[6],
+			"boot_signature" : data[7],
+			"volume_id" : data[8],
+			"volume_label" : data[9],
+			"boot_file_system_type" : data[10]
+		}
 
-	# Convert a FAT timestamp to a datetime object
-	def __parse_fat_datetime(self, v1, v2, v3):
-		hour, minute, second = v2 >> 11 & 0x1f, v2 >> 16 & 0x3f, (v2 & 0x1f) * 2
-		if v1 > 100:
-			second += 1
-			v1 -= 100
-		usec = v1 * 10000
-		d = self.__parse_fat_date(v3)
-		return datetime(d.year, d.month, d.day, hour, minute, second, usec)
+	def __parse_boot_sector16(self):
+		data = unpack("<BxBL11s8s", self.fd.read(26))
+		return {
+			"drive_num" : data[0],
+			"boot_signature" : data[1],
+			"volume_id" : data[2],
+			"volume_label" : data[3],
+			"boot_file_system_type" : data[4]
+		}
 
-	# Read and parse a FAT directory entry
-	def __read_dir_entry(self):
-		de = unpack("<11sBxBHHH2xHHHL", self.fd.read(FAT.DIRSIZE))
-		# TODO: Handle long filenames
-		if de[1] & FAT.Attribute.LONGNAME:
-			return None
+	def __check_max_cluster(self, cluster):
+		if type == FAT.Type.FAT12 :
+			return cluster < 4085
+
+		if type == FAT.Type.FAT16 :
+			return cluster < 65525
+
+		return True
+		
+	# Determines which type of FAT it is depending on the properties
+	def __determine_type(self):
+		root_dir_sectors = ((self.info["root_entry_count"] * FAT.DIRSIZE) + (self.info["byte_per_sector"] - 1)) / self.info["byte_per_sector"]
+		data_sectors = self.info["total_sectors"] - (self.info["reserved_sector_count"] + (self.info["num_fats"] * self.info["sectors_per_fat"]) + root_dir_sectors)
+		num_clusters = data_sectors / self.info["sectors_per_cluster"]
+		if num_clusters < 4085:
+			return (FAT.Type.FAT12, FAT.EOF_FAT12, num_clusters)
+		elif num_clusters < 65525:
+			return (FAT.Type.FAT16, FAT.EOF_FAT16, num_clusters)
 		else:
-			return {
-				"name": self.__normalize_name(de[0]),
-				"attributes": de[1],
-				"created": self.__parse_fat_datetime(de[2], de[3], de[4]),
-				"last_accessed": self.__parse_fat_date(de[5]),
-				"modified": self.__parse_fat_datetime(0, de[6], de[7]),
-				"cluster": de[8],
-				"size": de[9],
-				"direntry": self.fd.tell() - FAT.DIRSIZE
-			}
+			return (FAT.Type.FAT32, FAT.EOF_FAT32, num_clusters)
 
-	# Normalizes a 8.3 FAT filename
-	def __normalize_name(self, fatname):
-		if fatname[8:] == "   ":
-			# Skip the dot if there is no file extension
-			return fatname[:8].strip(" ")
-		else:
-			# Otherwise strip the spaces and dotify plus the extension
-			return fatname[:8].strip(" ") + "." + fatname[8:].strip(" ")
+	# Calculate the logical sector number from the cluster
+	def cluster_to_offset(self, cluster):
+		offset = ((cluster - 2) * self.info["sectors_per_cluster"]) * self.info["byte_per_sector"]
+		return self.__data_start_offset + offset
 
-	def __read_dir(self, offset):
+	def __update_fs_info(self, clusters, last_cluster):
+		if self.type != FAT.Type.FAT32 :
+			return
+		offset = self.info["fsinfo"] * self.info["byte_per_sector"]
 		self.fd.seek(offset, SEEK_SET)
-		items = []
-		for i in range(self.info["root_entries"]):
-			de = self.__read_dir_entry()
-			if not de:
-				continue
-			# Skip deleted files
-			if de["name"][0] == '\xe9':
-				continue
-			# Break when we hit the first blank filename
-			elif de["name"][0] == '\x00':
-				break
+		data = unpack("<L480xLLL12xL", self.fd.read(512))
+		if data[0] != 0x41615252 :
+			return
+		if data[1] != 0x61417272 :
+			return
+		if data[4] != 0xAA550000 :
+			return
+		self.fd.seek(offset + 488, SEEK_SET)
+		data = pack("<LL", data[2] - clusters, last_cluster)
+		self.fd.write(data)
+		self.fd.seek(offset, SEEK_SET)
+		data = unpack("<L480xLLL12xL", self.fd.read(512))
+
+	def __flatten(self, lst, rv = None):
+		if not rv :
+			rv = []
+		for i in lst:
+			if isinstance(i, list):
+				self.__flatten(i, rv)
 			else:
-				items.append(de)
-		return items
+				rv.append(i)
+		return rv
 
-	def get_label(self):
-		# FIXME: Is the label always located as the first file in the root directory?
-		self.fd.seek(self.__root_dir, SEEK_SET)
-		return unpack("11s", self.fd.read(11))[0].strip(" ")
+	def __eval_checksum(self, short_name11) :
+		sum = 0
+		for c in short_name11:
+			sum = (((sum & 0xFE)>> 1) + ((sum & 0x01) << 7) + ord(c)) & 0xFF
+		return sum
+		
+	def __write_lfn(self, long_file_name_array, index, checksum) :
+		if not long_file_name_array:
+			return
 
-	def read_file(self, path):
-		path = path.lower()
-		pos = path.rfind("/")
-		items = self.read_dir("" if pos < 0 else path[:pos])
-		if items:
-			items = filter(lambda x: x["name"].lower() == path[pos+1:], items)
-			if items:
-				item = items[0]
-				data = "".join([self.read_cluster(c) for c in self.get_cluster_chain(item["cluster"])])
-				return data[:item["size"]]
-		raise FAT.FileNotFoundError(path)
+		b0 = self.__flatten(
+			(index,
+			 long_file_name_array[0:5],
+			 FAT.Attribute.LONGNAME,
+			 0,
+			 checksum,
+			 long_file_name_array[5:11],
+			 0,
+			 long_file_name_array[11:13]))
 
-	def write_file(self, path):
-		raise NotImplementedError
+		data = pack("<B5HBBB6HH2H", *b0)
+		self.fd.write(data)
+		#print "unpack:", unpack("<32B", data)
+		self.__write_lfn(long_file_name_array[13:], (index & 0x3f) - 1, checksum)
 
-	def delete_file(self, path):
-		# Find the directory entry and replace the first character in the filenames
-		# with a 0xe5.  Then get the cluster chain and set all clusters to zero.
-		raise NotImplementedError
+	def __make_dir_entry(self, short_name11, create_time, start_cluster, file_size) :
+		if not self.__check_max_cluster(start_cluster):
+			raise FAT.FatalError
 
-	# Read all files from a directory
-	def read_dir(self, path=""):
-		# Start with the root directory
-		items = self.__read_dir(self.__root_dir)
-		# Filter out empty strings
-		subdirs = filter(len, path.lower().split("/"))
-		# Now look in all sub directories for our path
-		for d in subdirs:
-			# Get the one and only directory we are looking for
-			items = filter(lambda x: x["attributes"] & FAT.Attribute.DIRECTORY and x["name"].lower() == d, items)
-			if not items:
-				raise FAT.FileNotFoundError(path)
-			items = self.__read_dir(self.cluster_to_offset(items[0]["cluster"]))
-		return items
+		str_time= localtime(create_time)
+		wrt_date = (((str_time.tm_year - 1980) & 0x7F) << 9) | (str_time.tm_mon) << 5 | (str_time.tm_mday)
+		wrt_time = ((str_time.tm_hour) << 11) | (str_time.tm_min) << 5 | (str_time.tm_sec / 2 )
+		
+		dir_data = pack("<11sBBBHHHHHHHL", short_name11, 
+			FAT.Attribute.ARCHIVE,
+			0,
+			0,
+			wrt_time,
+			wrt_date,
+			wrt_date,
+			start_cluster / 0x10000,
+			wrt_time,
+			wrt_date,
+			start_cluster % 0x10000,
+			file_size)
 
-	def set_attribute(self, path, attr):
-		slash = path.rfind("/")
-		filename = path
-		if slash > 0:
-			path, filename = path[:slash], path[slash+1:]
-		else:
-			path = "/"
+		return dir_data
 
-		for f in self.read_dir(path):
-			if filename == f["name"]:
-				self.fd.seek(f["direntry"]+11, SEEK_SET)
-				self.fd.write(pack("B", attr))
-				break
+	def write_vfat(self, file_path, long_file_name, short_name, dir_offset, data_offset, fat_pos) :
+		b0 = map(ord, long_file_name)
+		b0.append(0)
+		l = len(b0)
+		l13 = ( l + 12 ) / 13 * 13
+		#print b0, l, l13
+		for v in range(l, l13):
+			b0.append(0xffff)
+
+		b1 = []
+		ll = len(b0)/13
+		for i in range(0, ll):
+			l0 = ll - i -1
+			#print l0 * 13, (l0  + 1) * 13
+			b1.extend(b0[l0 * 13:(l0 + 1)*13])
+		b0 = b1
+			
+		if short_name.find(".") < 0 :
+			basename = short_name
+			extension = "   "
+		else :
+			basename, extension = short_name.split(".")
+
+		for i in range(len(basename), 8):
+			basename += (" ")
+		for i in range(len(extension), 3):
+			extension += (" ")
+
+		#print "\"" + basename + "\"" +  extension + "\""
+		short_name11 = basename + extension
+		checksum = self.__eval_checksum(short_name11)
+
+		self.fd.seek(dir_offset, SEEK_SET)
+
+		self.__write_lfn(b0, 0x40 + l13 / 13, checksum)
+		b1 = b0[5:11]
+		data = pack("<13H", *b0[0:13])
+
+		file_size = path.getsize(file_path)
+		cluster_bytes = self.info["byte_per_sector"] * self.info["sectors_per_cluster"]
+		file_size_roundup = (file_size + cluster_bytes - 1) & ~(cluster_bytes - 1)
+		file_size_clusters = file_size_roundup / cluster_bytes
+
+		#print "file_size:", file_size, path.getctime(file_path)
+		dir_data = self.__make_dir_entry(short_name11, path.getctime(file_path), fat_pos, file_size) 
+
+		#print "dir_entry:", len(dir_data)
+		#print "dir_entry:", type(dir_data)
+		#print "dir_entry:", unpack("<32B", dir_data)
+
+		self.fd.write(dir_data)
+		dir_offset += l13 / 13 * FAT.DIRSIZE + len(dir_data)
+
+		self.fd.seek(data_offset, SEEK_SET)
+		with open(file_path, "rb") as f:
+			for i in range(0, file_size_clusters):
+				self.fd.write(f.read(cluster_bytes))
+
+		data_offset += file_size_roundup
+
+		self.fd.seek(self.__fat_start_offset + fat_pos * 4, SEEK_SET)
+		#print 4 + ((file_size + 511)/512)
+		for i in range(fat_pos, fat_pos + file_size_clusters - 1):
+			self.fd.write(pack("<L", i + 1))
+		#self.fd.write(pack("<L", 0x0fffffff))
+		self.fd.write(pack("<L", self.EOF))
+
+		fat_pos += file_size_clusters
+		self.__update_fs_info(file_size_clusters, fat_pos - 1)
+
+		return (dir_offset, data_offset, fat_pos) 
+		
